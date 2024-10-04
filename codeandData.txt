@@ -1,0 +1,1135 @@
+ <dependency>
+            <groupId>com.jointech.sdk</groupId>
+            <artifactId>jt707-sdk</artifactId>
+            <version>1.0.0</version>
+ </dependency>
+
+
+/**
+     * Parse Hex string raw data
+     * @param strData hexadecimal string
+     * @return
+     */
+    public static Object receiveData(String strData) {
+        int length=strData.length()%2>0?strData.length()/2+1:strData.length()/2;
+        ByteBuf msgBodyBuf = Unpooled.buffer(length);
+        msgBodyBuf.writeBytes(CommonUtil.hexStr2Byte(strData));
+        return receiveData(msgBodyBuf);
+    }
+
+    /**
+     *  Parse byte[] raw data
+     * @param bytes
+     * @return
+     */
+    private static Object receiveData(byte[] bytes)
+    {
+        ByteBuf msgBodyBuf =Unpooled.buffer(bytes.length);
+        msgBodyBuf.writeBytes(bytes);
+        return receiveData(msgBodyBuf);
+    }
+
+    /**
+     * Parse ByteBuf raw data
+     * @param in
+     * @return
+     */
+    private static Object receiveData(ByteBuf in)
+    {
+        Object decoded = null;
+        in.markReaderIndex();
+        int header = in.readByte();
+        if (header == Constant.TEXT_MSG_HEADER) {
+            in.resetReaderIndex();
+            decoded = ParserUtil.decodeTextMessage(in);
+        } else if (header == Constant.BINARY_MSG_HEADER) {
+            in.resetReaderIndex();
+            decoded = ParserUtil.decodeBinaryMessage(in);
+        } else {
+            return null;
+        }
+        return JSONArray.toJSON(decoded).toString();
+    }
+
+
+
+package com.jointech.sdk.jt707.utils;
+
+import com.jointech.sdk.jt707.constants.Constant;
+import com.jointech.sdk.jt707.model.LocationData;
+import com.jointech.sdk.jt707.model.Result;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufUtil;
+import io.netty.buffer.Unpooled;
+import org.apache.commons.lang3.StringUtils;
+
+import java.time.ZonedDateTime;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * <p>Description:Analysis method tool class</p>
+ * @author HyoJung
+ * @date 20210526
+ */
+public class ParserUtil {
+    /**
+     * Parse Positioning data 0x0200
+     * @param in
+     * @return
+     */
+    public static Result decodeBinaryMessage(ByteBuf in) {
+        //unexcape rawdata
+        ByteBuf msg = (ByteBuf) PacketUtil.decodePacket(in);
+        //message length
+        int msgLen = msg.readableBytes();
+        //packet header
+        msg.readByte();
+        //message ID
+        int msgId = msg.readUnsignedShort();
+        //message body properties
+        int msgBodyAttr = msg.readUnsignedShort();
+        //message body length
+        int msgBodyLen = msgBodyAttr & 0b00000011_11111111;
+        //Whether to subcontract
+        boolean multiPacket = (msgBodyAttr & 0b00100000_00000000) > 0;
+        //Remove the base length of the message body
+        int baseLen = Constant.BINARY_MSG_BASE_LENGTH;
+
+        //The following packet length is obtained according to the length of the message body and whether it is subcontracted
+        int ensureLen = multiPacket ? baseLen + msgBodyLen + 4 : baseLen + msgBodyLen;
+        if (msgLen != ensureLen) {
+            return null;
+        }
+         //array of deviceID
+        byte[] terminalNumArr = new byte[6];
+        msg.readBytes(terminalNumArr);
+        //Device ID (remove leading 0)
+        String terminalNumber = StringUtils.stripStart(ByteBufUtil.hexDump(terminalNumArr), "0");
+        //message serial number
+        int msgFlowId = msg.readUnsignedShort();
+        //total number of message packets
+        int packetTotalCount = 0;
+        //package serial number
+        int packetOrder = 0;
+        //subcontract
+        if (multiPacket) {
+            packetTotalCount = msg.readShort();
+            packetOrder = msg.readShort();
+        }
+        //message body
+        byte[] msgBodyArr = new byte[msgBodyLen];
+        msg.readBytes(msgBodyArr);
+        if(msgId==0x0200) {
+            //Parse the message body
+            LocationData locationData=parseLocationBody(Unpooled.wrappedBuffer(msgBodyArr));
+            locationData.setIndex(msgFlowId);
+            locationData.setDataLength(msgBodyLen);
+            //check code
+            int checkCode = msg.readUnsignedByte();
+            //packet end
+            msg.readByte();
+            //Get message response content
+            String replyMsg= PacketUtil.replyBinaryMessage(terminalNumArr,msgFlowId);
+            //Define the location data entity class
+            Result model = new Result();
+            model.setDeviceID(terminalNumber);
+            model.setMsgType("Location");
+            model.setDataBody(locationData);
+            model.setReplyMsg(replyMsg);
+            return model;
+        }else {
+            //Define the location data entity class
+            Result model = new Result();
+            model.setDeviceID(terminalNumber);
+            model.setMsgType("heartbeat");
+            model.setDataBody(null);
+            return model;
+        }
+    }
+
+    /**
+     * Parse instruction data
+     * @param in raw data 
+     * @return
+     */
+    public static Result decodeTextMessage(ByteBuf in) {
+
+         //The read pointer is set to the message header
+        in.markReaderIndex();
+        //Look for the end of the message, if not found, continue to wait for the next packet
+        int tailIndex = in.bytesBefore(Constant.TEXT_MSG_TAIL);
+        if (tailIndex < 0) {
+            in.resetReaderIndex();
+            return null;
+        }
+        //Define the location data entity class
+        Result model = new Result();
+        //packet header(
+        in.readByte();
+        //Field list
+        List<String> itemList = new ArrayList<String>();
+        while (in.readableBytes() > 0) {
+            //Query the subscript of comma to intercept data
+            int index = in.bytesBefore(Constant.TEXT_MSG_SPLITER);
+            int itemLen = index > 0 ? index : in.readableBytes() - 1;
+            byte[] byteArr = new byte[itemLen];
+            in.readBytes(byteArr);
+            in.readByte();
+            itemList.add(new String(byteArr));
+        }
+        String msgType = "";
+        if (itemList.size() >= 5) {
+            msgType = itemList.get(3) + itemList.get(4);
+        }
+        Object dataBody=null;
+        if(itemList.size()>0){
+            dataBody="(";
+            for(String item :itemList) {
+                dataBody+=item+",";
+            }
+            dataBody=CommonUtil.trimEnd(dataBody.toString(),",");
+            dataBody += ")";
+        }
+        String replyMsg="";
+        if(msgType.equals("BASE2")&&itemList.get(5).toUpperCase().equals("TIME")) {
+            replyMsg=PacketUtil.replyBASE2Message(itemList);
+        }
+        model.setDeviceID(itemList.get(0));
+        model.setMsgType(msgType);
+        model.setDataBody(dataBody);
+        model.setReplyMsg(replyMsg);
+        return model;
+    }
+
+    /**
+     * Parse and locate message body
+     * @param msgBodyBuf
+     * @return
+     */
+    private static LocationData parseLocationBody(ByteBuf msgBodyBuf){
+         //alarm sign
+        long alarmFlag = msgBodyBuf.readUnsignedInt();
+        //Device status
+        long status = msgBodyBuf.readUnsignedInt();
+        //latitude
+        double lat = NumberUtil.multiply(msgBodyBuf.readUnsignedInt(), NumberUtil.COORDINATE_PRECISION);
+        //longitude
+        double lon = NumberUtil.multiply(msgBodyBuf.readUnsignedInt(), NumberUtil.COORDINATE_PRECISION);
+        //Altitude, in meters
+        int altitude = msgBodyBuf.readShort();
+        //Speed
+        double speed = NumberUtil.multiply(msgBodyBuf.readUnsignedShort(), NumberUtil.ONE_PRECISION);
+        //directioin
+        int direction = msgBodyBuf.readShort();
+        //GPS time
+        byte[] timeArr = new byte[6];
+        msgBodyBuf.readBytes(timeArr);
+        String bcdTimeStr = ByteBufUtil.hexDump(timeArr);
+        ZonedDateTime gpsZonedDateTime = CommonUtil.parseBcdTime(bcdTimeStr);
+         //Determine whether the south latitude and west longitude are based on the value of the status bit
+        if (NumberUtil.getBitValue(status, 2) == 1) {
+            lat = -lat;
+        }
+        if (NumberUtil.getBitValue(status, 3) == 1) {
+            lon = -lon;
+        }
+        //Positioning status
+        int locationType=NumberUtil.getBitValue(status, 18);
+        if(locationType==0)
+        {
+            locationType = NumberUtil.getBitValue(status, 1);
+        }
+        if(locationType==0)
+        {
+            locationType = NumberUtil.getBitValue(status, 6) > 0 ? 2 : 0;
+        }
+
+        LocationData locationData=new LocationData();
+        locationData.setGpsTime(gpsZonedDateTime.toString());
+        locationData.setLatitude(lat);
+        locationData.setLongitude(lon);
+        locationData.setLocationType(locationType);
+        locationData.setSpeed((int)speed);
+        locationData.setDirection(direction);
+        //Handling additional information
+        if (msgBodyBuf.readableBytes() > 0) {
+            parseExtraInfo(msgBodyBuf, locationData);
+        }
+        return locationData;
+    }
+
+    /**
+     * Parse additional information
+     *
+     * @param msgBody
+     * @param location
+     */
+    private static void parseExtraInfo(ByteBuf msgBody, LocationData location) {
+        ByteBuf extraInfoBuf = null;
+        while (msgBody.readableBytes() > 1) {
+            int extraInfoId = msgBody.readUnsignedByte();
+            int extraInfoLen = msgBody.readUnsignedByte();
+            if (msgBody.readableBytes() < extraInfoLen) {
+                break;
+            }
+            extraInfoBuf = msgBody.readSlice(extraInfoLen);
+            switch (extraInfoId) {
+                case 0x0F:
+                    //Parsing temperature data
+                    double temperature = -1000.0;
+                    temperature = parseTemperature(extraInfoBuf.readShort());
+                    location.setTemperature((int)temperature);
+                    break;
+                //Wireless communication network signal strength
+                case 0x30:
+                    int fCellSignal=extraInfoBuf.readByte();
+                    location.setGSMSignal(fCellSignal);
+                    break;
+                 //number of satellites
+                case 0x31:
+                    int fGPSSignal=extraInfoBuf.readByte();
+                    location.setGpsSignal(fGPSSignal);
+                    break;
+                //battery percentage
+                case 0xD4:
+                    int fBattery=extraInfoBuf.readUnsignedByte();
+                    location.setBattery(fBattery);
+                    break;
+                 //battery voltage
+                case 0xD5:
+                    int fVoltage=extraInfoBuf.readUnsignedShort();
+                    location.setBattery(fVoltage*0.01);
+                    break;
+                case 0xDA:
+                    //Number of rope cuts
+                    int fTimes =extraInfoBuf.readUnsignedShort();
+                    //Status bit
+                    int status =extraInfoBuf.readUnsignedByte();
+                    //Lock status big
+                    int fLockStatus=(status&0b0000_0001)==1?0:1;
+                    //motion status
+                    int fRunStatus=(status&0b0000_0010)>0?1:0;
+                    //Sim card status
+                    int fSimStatus=(status&0b0000_0100)>0?1:0;
+                    //wake-up source
+                    int fWakeSource=((status>>3)&0b0111);
+                    location.setLockStatus(fLockStatus);
+                    location.setLockRope(fLockStatus);
+                    location.setUnLockTime(fTimes);
+                    location.setRunStatus(fRunStatus);
+                    location.setSimStatus(fSimStatus);
+                    location.setAwaken(fWakeSource);
+                    break;
+                case 0xDB:
+                    //Number of positioning data sent
+                    int sendCount=extraInfoBuf.readUnsignedShort();
+                    location.setSendDataCount(sendCount);
+                    break;
+                case 0xDC:
+                    //Debug
+                    byte[] debugArr = new byte[4];
+                    extraInfoBuf.readBytes(debugArr);
+                    String strDebug=ByteBufUtil.hexDump(debugArr);
+                    break;
+                case 0xF8:
+                    //temperature value
+                    int temp=extraInfoBuf.readUnsignedShort();
+                    if(temp==0xffff){
+                        location.setTemperature(-1000);
+                    }else {
+                        temp=(temp / 10)-50;
+                        location.setTemperature(temp);
+                    }
+                    break;
+                case 0xF9:
+                    //Protocol version
+                    int version=extraInfoBuf.readUnsignedShort();
+                    break;
+                case 0xFD:
+                    //LBS info.
+                    int mcc=extraInfoBuf.readUnsignedShort();
+                    location.setMCC(mcc);
+                    int mnc=extraInfoBuf.readUnsignedByte();
+                    location.setMNC(mnc);
+                    long cellId=extraInfoBuf.readUnsignedInt();
+                    location.setCELLID((int)cellId);
+                    int lac=extraInfoBuf.readUnsignedShort();
+                    location.setLAC(lac);
+                    break;
+                case 0xFE:
+                    long mileage = extraInfoBuf.readUnsignedInt();
+                    location.setMileage(mileage);
+                    break;
+                default:
+                    ByteBufUtil.hexDump(extraInfoBuf);
+                    break;
+            }
+        }
+    }
+
+    /**
+     * Parse temperature
+     * @param temperatureInt
+     * @return
+     */
+    private static double parseTemperature(int temperatureInt) {
+        if (temperatureInt == 0xFFFF) {
+            return -1000;
+        }
+        double temperature = ((short) (temperatureInt << 4) >> 4) * 0.1;
+        if ((temperatureInt >> 12) > 0) {
+            temperature = -temperature;
+        }
+        return temperature;
+    }
+}
+
+
+
+package com.jointech.sdk.jt707.utils;
+
+import com.jointech.sdk.jt707.constants.Constant;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.ByteBufUtil;
+import io.netty.util.ReferenceCountUtil;
+
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
+import java.util.Random;
+
+/**
+ *  Parse package preprocessing (do unescaping)
+ * @author HyoJung
+ */
+public class PacketUtil {
+    /**
+     *  Parse message packets
+     *
+     * @param in
+     * @return
+     */
+    public static Object decodePacket(ByteBuf in) {
+        //The readable length cannot be less than the base length
+        if (in.readableBytes() < Constant.BINARY_MSG_BASE_LENGTH) {
+            return null;
+        }
+
+        //Prevent illegal code stream attacks, the data is too large to be abnormal data
+        if (in.readableBytes() > Constant.BINARY_MSG_MAX_LENGTH) {
+            in.skipBytes(in.readableBytes());
+            return null;
+        }
+
+        //Look for the end of the message, if not found, continue to wait for the next packet
+        in.readByte();
+        int tailIndex = in.bytesBefore(Constant.BINARY_MSG_HEADER);
+        if (tailIndex < 0) {
+            in.resetReaderIndex();
+            return null;
+        }
+
+        int bodyLen = tailIndex;
+         //Create a ByteBuf to store the reversed data
+        ByteBuf frame = ByteBufAllocator.DEFAULT.heapBuffer(bodyLen + 2);
+        frame.writeByte(Constant.BINARY_MSG_HEADER);
+        //The data between the header and the end of the message is escaped
+        unescape(in, frame, bodyLen);
+        in.readByte();
+        frame.writeByte(Constant.BINARY_MSG_HEADER);
+
+        //The length after the reverse escape cannot be less than the base length
+        if (frame.readableBytes() < Constant.BINARY_MSG_BASE_LENGTH) {
+            ReferenceCountUtil.release(frame);
+            return null;
+        }
+        return frame;
+    }
+
+    /**
+     * In the message header, message body and check code, 0x7D 0x02 is reversed to 0x7E, and 0x7D 0x01 is reversed to 0x7D
+     *
+     * @param in
+     * @param frame
+     * @param bodyLen
+     */
+    public static void unescape(ByteBuf in, ByteBuf frame, int bodyLen) {
+        int i = 0;
+        while (i < bodyLen) {
+            int b = in.readUnsignedByte();
+            if (b == 0x7D) {
+                int nextByte = in.readUnsignedByte();
+                if (nextByte == 0x01) {
+                    frame.writeByte(0x7D);
+                } else if (nextByte == 0x02) {
+                    frame.writeByte(0x7E);
+                } else {
+                     //abnormal data
+                    frame.writeByte(b);
+                    frame.writeByte(nextByte);
+                }
+                i += 2;
+            } else {
+                frame.writeByte(b);
+                i++;
+            }
+        }
+    }
+
+    /**
+     * In the message header, message body and check code, 0x7E is escaped as 0x7D 0x02, and 0x7D is escaped as 0x7D 0x01
+     *
+     * @param out
+     * @param bodyBuf
+     */
+    public static void escape(ByteBuf out, ByteBuf bodyBuf) {
+        while (bodyBuf.readableBytes() > 0) {
+            int b = bodyBuf.readUnsignedByte();
+            if (b == 0x7E) {
+                out.writeShort(0x7D02);
+            } else if (b == 0x7D) {
+                out.writeShort(0x7D01);
+            } else {
+                out.writeByte(b);
+            }
+        }
+    }
+
+    /**
+     * reply content
+     * @param terminalNumArr
+     * @param msgFlowId
+     * @return
+     */
+    public static String replyBinaryMessage(byte[] terminalNumArr,int msgFlowId) {
+        //Remove the length of the head and tail
+        int contentLen = Constant.BINARY_MSG_BASE_LENGTH + 4;
+        ByteBuf bodyBuf = ByteBufAllocator.DEFAULT.heapBuffer(contentLen-2);
+        ByteBuf replyBuf = ByteBufAllocator.DEFAULT.heapBuffer(25);
+        try {
+            //message ID
+            bodyBuf.writeShort(0x8001);
+            //data length
+            bodyBuf.writeShort(0x0005);
+            //Device ID
+            bodyBuf.writeBytes(terminalNumArr);
+            Random random = new Random();
+            //Generate random numbers from 1-65534
+            int index = random.nextInt() * (65534 - 1 + 1) + 1;
+            //current message serial number
+            bodyBuf.writeShort(index);
+            //response message serial number
+            bodyBuf.writeShort(msgFlowId);
+            //response message ID
+            bodyBuf.writeShort(0x0200);
+            //response result
+            bodyBuf.writeByte(0x00);
+            //check code
+            int checkCode = CommonUtil.xor(bodyBuf);
+            bodyBuf.writeByte(checkCode);
+            //packet header
+            replyBuf.writeByte(Constant.BINARY_MSG_HEADER);
+            //The read pointer is reset to the starting position
+            bodyBuf.readerIndex(0);
+            //escape
+            PacketUtil.escape(replyBuf, bodyBuf);
+            //packet end
+            replyBuf.writeByte(Constant.BINARY_MSG_HEADER);
+            return ByteBufUtil.hexDump(replyBuf);
+        } catch (Exception e) {
+            ReferenceCountUtil.release(replyBuf);
+            return "";
+        }
+    }
+
+    /**
+     *  Timing command reply
+     * @param itemList
+     */
+    public static String replyBASE2Message(List<String> itemList) {
+        try {
+            //set date format
+            ZonedDateTime currentDateTime = ZonedDateTime.now(ZoneOffset.UTC);
+            String strBase2Reply = String.format("(%s,%s,%s,%s,%s,%s)", itemList.get(0), itemList.get(1)
+                    , itemList.get(2), itemList.get(3), itemList.get(4), DateTimeFormatter.ofPattern("yyyyMMddHHmmss").format(currentDateTime));
+           return strBase2Reply;
+        }catch (Exception e) {
+            return "";
+        }
+    }
+}
+
+
+package com.jointech.sdk.jt707.utils;
+
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * digital tools
+ * @author HyoJung
+ * @date 20210526
+ */
+public class NumberUtil {
+    /**
+     * Coordinate accuracy
+     */
+    public static final BigDecimal COORDINATE_PRECISION = new BigDecimal("0.000001");
+
+    /**
+     * Coordinate factor
+     */
+    public static final BigDecimal COORDINATE_FACTOR = new BigDecimal("1000000");
+
+    /**
+     * One decimal place precision
+     */
+    public static final BigDecimal ONE_PRECISION = new BigDecimal("0.1");
+
+    private NumberUtil() {
+    }
+
+    /**
+     * Format message ID (convert to 0xXXXX)
+     *
+    * @param msgId Message ID
+     * @return format string
+     */
+    public static String formatMessageId(int msgId) {
+        return String.format("0x%04x", msgId);
+    }
+
+    /**
+     * format short numbers
+     *
+     * @param num number
+     * @return format string
+     */
+    public static String formatShortNum(int num) {
+        return String.format("0x%02x", num);
+    }
+
+   /**
+     * Convert 4-digit hexadecimal string
+     *
+     * @param num digits
+     * @return format string
+     */
+    public static String hexStr(int num) {
+        return String.format("%04x", num).toUpperCase();
+    }
+
+    /**
+     * Parse the value of type short and get the number of digits whose value is 1
+     *
+     * @param number
+     * @return
+     */
+    public static List<Integer> parseShortBits(int number) {
+        List<Integer> bits = new ArrayList<>();
+        for (int i = 0; i < 16; i++) {
+            if (getBitValue(number, i) == 1) {
+                bits.add(i);
+            }
+        }
+        return bits;
+    }
+
+    /**
+     * Parse the value of type int and get the number of digits whose value is 1
+     *
+     * @param number
+     * @return
+     */
+    public static List<Integer> parseIntegerBits(long number) {
+        List<Integer> bits = new ArrayList<>();
+        for (int i = 0; i < 32; i++) {
+            if (getBitValue(number, i) == 1) {
+                bits.add(i);
+            }
+        }
+        return bits;
+    }
+
+    /**
+     * Get the value of the index-th bit in binary
+     *
+     * @param number
+     * @param index
+     * @return
+     */
+    public static int getBitValue(long number, int index) {
+        return (number & (1 << index)) > 0 ? 1 : 0;
+    }
+
+    /**
+     * bit list to int
+     *
+     * @param bits
+     * @param len
+     * @return
+     */
+    public static int bitsToInt(List<Integer> bits, int len) {
+        if (bits == null || bits.isEmpty()) {
+            return 0;
+        }
+
+        char[] chars = new char[len];
+        for (int i = 0; i < len; i++) {
+            char value = bits.contains(i) ? '1' : '0';
+            chars[len - 1 - i] = value;
+        }
+        int result = Integer.parseInt(new String(chars), 2);
+        return result;
+    }
+
+    /**
+     *  bit list to long
+     *
+     * @param bits
+     * @param len
+     * @return
+     */
+    public static long bitsToLong(List<Integer> bits, int len) {
+        if (bits == null || bits.isEmpty()) {
+            return 0L;
+        }
+
+        char[] chars = new char[len];
+        for (int i = 0; i < len; i++) {
+            char value = bits.contains(i) ? '1' : '0';
+            chars[len - 1 - i] = value;
+        }
+        long result = Long.parseLong(new String(chars), 2);
+        return result;
+    }
+
+    /**
+     * BigDecimal Multiplication
+     *
+     * @param longNum
+     * @param precision
+     * @return
+     */
+    public static double multiply(long longNum, BigDecimal precision) {
+        return new BigDecimal(String.valueOf(longNum)).multiply(precision).doubleValue();
+    }
+
+    /**
+     * BigDecimal Multiplication
+     *
+     * @param longNum
+     * @param precision
+     * @return
+     */
+    public static double multiply(int longNum, BigDecimal precision) {
+        return new BigDecimal(String.valueOf(longNum)).multiply(precision).doubleValue();
+    }
+}
+
+
+package com.jointech.sdk.jt707.utils;
+
+import io.netty.buffer.ByteBuf;
+
+import java.nio.ByteBuffer;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+
+/**
+ * <p>Description: Used to store some public methods encountered in parsing</p>
+ *
+ * @author lenny
+ * @version 1.0.1
+ * @date 20210328
+ */
+public class CommonUtil {
+    /**
+     * remove last character from string
+     * @param inStr input string
+     * @param suffix characters to remove
+     * @return
+     */
+    public static String trimEnd(String inStr, String suffix) {
+        while(inStr.endsWith(suffix)){
+            inStr = inStr.substring(0,inStr.length()-suffix.length());
+        }
+        return inStr;
+    }
+
+    /**
+     * Hexadecimal to byte[]
+     * @param hex
+     * @return
+     */
+    public static byte[] hexStr2Byte(String hex) {
+        ByteBuffer bf = ByteBuffer.allocate(hex.length() / 2);
+        for (int i = 0; i < hex.length(); i++) {
+            String hexStr = hex.charAt(i) + "";
+            i++;
+            hexStr += hex.charAt(i);
+            byte b = (byte) Integer.parseInt(hexStr, 16);
+            bf.put(b);
+        }
+        return bf.array();
+    }
+
+    /**
+     * Convert GPS time
+     *
+     * @param bcdTimeStr
+     * @return
+     */
+    public static ZonedDateTime parseBcdTime(String bcdTimeStr) {
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyMMddHHmmss");
+        LocalDateTime localDateTime = LocalDateTime.parse(bcdTimeStr, formatter);
+        ZonedDateTime zonedDateTime = ZonedDateTime.of(localDateTime, ZoneOffset.UTC);
+        return zonedDateTime;
+    }
+
+    /**
+     *XOR evaluation of each byte
+     *
+     * @param buf
+     * @return
+     */
+    public static int xor(ByteBuf buf) {
+        int checksum = 0;
+        while (buf.readableBytes() > 0) {
+            checksum ^= buf.readUnsignedByte();
+        }
+        return checksum;
+    }
+}
+
+
+package com.jointech.sdk.jt707.base;
+
+import java.io.Serializable;
+
+/**
+ * base enumeration
+ * @author HyoJung
+ */
+public interface BaseEnum  <T> extends Serializable {
+    T getValue();
+}
+
+package com.jointech.sdk.jt707.constants;
+
+/**
+ * constant definition
+ * @author HyoJung
+ * @date 20210526
+ */
+public class Constant {
+    private Constant(){}
+    /**
+     * binary message header
+     */
+    public static final byte BINARY_MSG_HEADER = 0x7E;
+    /**
+     * Base length without message body
+     */
+    public static final int BINARY_MSG_BASE_LENGTH = 15;
+
+    /**
+     * message length
+     */
+    public static final int BINARY_MSG_MAX_LENGTH = 102400;
+
+    /**
+     * text message header
+     */
+    public static final byte TEXT_MSG_HEADER = '(';
+
+    /**
+     * text message tail
+     */
+    public static final byte TEXT_MSG_TAIL = ')';
+
+    /**
+     *text message delimiter
+     */
+    public static final byte TEXT_MSG_SPLITER = ',';
+}
+
+
+package com.jointech.sdk.jt707.model;
+
+import com.alibaba.fastjson.annotation.JSONField;
+import lombok.Data;
+
+import java.io.Serializable;
+
+/**
+ * <p>Description: Location entity class</p>
+ *
+ * @author lenny
+ * @version 1.0.1
+ * @date 20210328
+ */
+@Data
+public class LocationData implements Serializable {
+    /**
+     * Messagebody
+     */
+    @JSONField(name = "DataLength")
+    public int DataLength;
+    /**
+     * positioning time
+     */
+    @JSONField(name = "GpsTime")
+    public String GpsTime;
+    /**
+     * Latitude
+     */
+    @JSONField(name = "Latitude")
+    public double Latitude;
+    /**
+     * Longitude
+     */
+    @JSONField(name = "Longitude")
+    public double Longitude;
+    /**
+     *  Positioning type
+     */
+    @JSONField(name = "LocationType")
+    public int LocationType;
+    /**
+     * Speed
+     */
+    @JSONField(name = "Speed")
+    public int Speed;
+    /**
+     * Direction
+     */
+    @JSONField(name = "Direction")
+    public int Direction;
+    /**
+     * Mileage
+     */
+    @JSONField(name = "Mileage")
+    public long Mileage;
+    /**
+     * GpsSignal
+     */
+    @JSONField(name = "GpsSignal")
+    public int GpsSignal;
+    /**
+     * GSMSignal
+     */
+    @JSONField(name = "GSMSignal")
+    public int GSMSignal;
+    /**
+     * Battery
+     */
+    @JSONField(name = "Battery")
+    public double Battery;
+    /**
+     *  Voltage
+     */
+    @JSONField(name = "Voltage")
+    public int Voltage;
+    /**
+     * Device lock status
+     */
+    @JSONField(name = "LockStatus")
+    public int LockStatus;
+    /**
+     * Lock rope status
+     */
+    @JSONField(name = "LockRope")
+    public int LockRope;
+    /**
+     * Number of rope cuts
+     */
+    @JSONField(name = "UnLockTime")
+    public int UnLockTime;
+    /**
+     * Motion status
+     */
+    @JSONField(name = "RunStatus")
+    public int RunStatus;
+    /**
+     * Sim card type
+     */
+    @JSONField(name = "SimStatus")
+    public int SimStatus;
+    /**
+     * Number of positioning data sent
+     */
+    @JSONField(name = "SendDataCount")
+    public int SendDataCount;
+    /**
+     * MCC
+     */
+    @JSONField(name = "MCC")
+    public int MCC;
+    /**
+     * MNC
+     */
+    @JSONField(name = "MNC")
+    public int MNC;
+    /**
+     * LAC
+     */
+    @JSONField(name = "LAC")
+    public int LAC;
+    /**
+     * CELLID
+     */
+    @JSONField(name = "CELLID")
+    public long CELLID;
+    /**
+     * Awaken
+     */
+    @JSONField(name = "Awaken")
+    public int Awaken;
+    /**
+     * Data serial number
+     */
+    @JSONField(name = "Index")
+    public int Index;
+    /**
+     * Temperature
+     */
+    @JSONField(name = "Temperature")
+    public int Temperature=-1000;
+}
+
+package com.jointech.sdk.jt707.model;
+
+import com.alibaba.fastjson.annotation.JSONField;
+import lombok.Data;
+
+import java.io.Serializable;
+
+/**
+ * result entity class
+ * @author HyoJung
+ * @date 20210526
+ */
+@Data
+public class Result implements Serializable {
+    @JSONField(name = "DeviceID")
+    private String DeviceID;
+    @JSONField(name = "MsgType")
+    private String MsgType;
+    @JSONField(name = "DataBody")
+    private Object DataBody;
+    @JSONField(name = "ReplyMsg")
+    private String ReplyMsg;
+}
+
+
+
+2.4.Return message and description
+(1)Heartbeat data
+Raw data:
+
+7E00020000770191203915FFF2E47E
+Return message:
+
+{"DeviceID":"770191203915","MsgType":"heartbeat"}
+Return message description
+
+{"DeviceID":DeviceID,"MsgType":messagetype（heartbeat：heartbeat）}
+(2) positioning data
+Rawdata:
+
+7E02000047770191203915000D000000000104100201588F7D0206CA3F580000001C000121072201060230011F310106D40164D5020050DA03000105DB02000CDC0400000000FD0901CC00000010922866F80203421B7E
+Return content:
+
+{
+    "DeviceID": "770191203915",
+    "DataBody": {
+        "GpsTime": "2021-07-22T01:06:02Z",
+        "Temperature": 33,
+        "MNC": 0,
+        "UnLockTime": 1,
+        "RunStatus": 0,
+        "Index": 13,
+        "Latitude": 22.581118,
+        "Awaken": 0,
+        "SimStatus": 1,
+        "Direction": 1,
+        "Battery": 100,
+        "GpsSignal": 6,
+        "Voltage": 0.8,
+        "Speed": 2,
+        "LockStatus": 0,
+        "Mileage": 0,
+        "MCC": 460,
+        "Longitude": 113.917784,
+        "LAC": 10342,
+        "DataLength": 71,
+        "CELLID": 4242,
+        "LockRope": 0,
+        "LocationType": 1,
+        "SendDataCount": 12,
+        "GSMSignal": 31
+    },
+    "ReplyMsg": "7e80010005770191203915ee25000d020000ab7e",
+    "MsgType": "Location"
+}
+Return message Description
+
+{
+    "DeviceID":  DeviceID,
+    "DataBody": {
+        "Index": Data serial number,
+        "DataLength": Data length(Bytes),
+        "GpsTime": GPStime（UTC）,
+        "Latitude": Latitude（WGS84）,
+        "Longitude": Longitude（WGS84）,
+        "Temperature": temperature value，33 indicates the current temperature is 33°C,
+        "UnLockTime": Number of rope cutting and unlocking,
+        "RunStatus": Motion status (1: motion; 0: static),
+        "Awaken": 0: RTC reporting 1: Rope cutting reporting, 2: Rope insertion reporting 3: Cover opening reporting 4: Cover closing reporting 5: Charging/configuring/simulating rope cutting reporting,
+        "SimStatus": SIM card type 0: eSIM card; 1: Micro SIM card slot,
+        "Direction": True North is 0, clockwise 0-359,
+        "Battery": Battery percentage（0~100%）,
+        "GpsSignal": Number of satellites currently received by GPS,
+        "Voltage": Battery voltage,unit:Volts,
+        "Speed": Speed,unit:KM/H,
+        "LockStatus": Device lock status（0：locked；1：unlock）,
+        "LockRope": Lock rope status（0：inserted；1：pull out）,
+        "Mileage": Mileage,unit:KM,
+        "MCC": MCC,
+        "MNC": MNC,
+        "LAC": LAC,
+        "CELLID": CELLID,
+        "LocationType": Positioning type（1：GPS positioning；0：No positioning）,
+        "SendDataCount": Number of sent data,
+        "GSMSignal": GSM signal
+    },
+    "ReplyMsg": Need to reply to the command of the device,
+    "MsgType": Data type（Location：Position data）
+}
+(3) Command data parsing
+Rawdata:
+
+283737303139313230333930362c312c3030312c424153452c362c352c33302c3529
+Return message:
+
+{
+    "DeviceID": "770191203906",
+    "DataBody": "(770191203906,1,001,BASE,6,5,30,5)",
+    "ReplyMsg": "",
+    "MsgType": "BASE6"
+}
+Return message description
+
+{
+    "DeviceID": DeviceID,
+    "DataBody": Message Content,
+    "ReplyMsg": Reply to the device message (empty means no reply is required),
+    "MsgType": command type
+}
